@@ -1,88 +1,102 @@
-import { Injectable } from '@angular/core';
+import { inject, Injectable } from '@angular/core';
 import { SourceType } from './ngx-source-type.model';
 import { ISource } from './ngx-source.model';
+import { ISourceLoadResult } from './ngx-source-load-result.model';
+import { DOCUMENT } from '@angular/common';
 
-declare let document: any;
-
-@Injectable({
-  providedIn: 'root',
-})
+@Injectable()
 export class NgxSourceService {
-  private sources: ISource[] = [];
+  private readonly document = inject(DOCUMENT);
+  private readonly sources = new Map<string, Set<ISource>>();
 
   public addSources(...sources: ISource[]): void {
-    sources.forEach((source: ISource) => this.addSource(source));
+    sources.forEach(source => this.addSource(source));
   }
 
   public addSource(source: ISource): void {
-    const notExist = !this.sources.find((existSource: ISource) => existSource.name === source.name);
-    if (notExist) {
-      this.sources.push(source);
+    if (!this.sources.has(source.name)) {
+      this.sources.set(source.name, new Set());
+    }
+
+    const sourceSet = this.sources.get(source.name)!;
+    const serialized = JSON.stringify(source);
+
+    const alreadyExists = Array.from(sourceSet).some(s => JSON.stringify(s) === serialized);
+    if (!alreadyExists) {
+      sourceSet.add(source);
     }
   }
 
-  public loadBySourceNames(...sourceNames: string[]): Promise<any> {
-    const promises: any[] = [];
-    sourceNames.forEach(sourceName => promises.push(this.loadBySourceName(sourceName)));
-    return Promise.all(promises);
+  public loadBySourceNames(...sourceNames: string[]): Promise<ISourceLoadResult[]> {
+    return Promise.all(sourceNames.flatMap(name => this.loadBySourceName(name)));
   }
 
-  public loadBySourceName(sourceName: string): Promise<any> {
-    const source = this.sources.find(value => value.name === sourceName);
-    if (!source) {
-      // resolve if not find
-      return Promise.resolve({ script: sourceName, loaded: false, status: 'Not Find in Source Store' });
-    } else {
-      return this.loadSource(source);
+  public loadBySourceName(sourceName: string): Promise<ISourceLoadResult>[] {
+    const sources = this.sources.get(sourceName);
+    if (!sources || sources.size === 0) {
+      return [
+        Promise.reject({
+          script: sourceName,
+          loaded: false,
+          status: 'Not found in source store',
+        }),
+      ];
     }
+
+    return Array.from(sources).map(source => this.loadSource(source));
   }
 
-  public loadSources(sources: ISource[]): Promise<any> {
+  public loadSources(sources: ISource[]): Promise<ISourceLoadResult[]> {
     this.addSources(...sources);
-    const promises: any[] = [];
-    sources.forEach(source => promises.push(this.loadSource(source)));
-    return Promise.all(promises);
+    return Promise.all(sources.map(source => this.loadSource(source)));
   }
 
-  public loadSource(source: ISource): Promise<any> {
+  public loadSource(source: ISource): Promise<ISourceLoadResult> {
     this.addSource(source);
-    return new Promise<any>(resolve => {
-      if (source.loaded) {
-        // resolve if already loaded
-        resolve({ script: source.name, loaded: true, status: 'Already Loaded' });
-      } else {
-        let element: any;
-        if (source.type === SourceType.STYLE) {
-          // load style
-          element = document.createElement('link');
-          element.rel = 'stylesheet';
-          element.href = source.src;
-        } else {
-          // load script
-          element = document.createElement('script');
-          element.type = 'text/javascript';
-          element.src = source.src;
-        }
 
-        if (element.readyState) {
-          // IE
-          element.onreadystatechange = () => {
-            if (element.readyState === 'loaded' || element.readyState === 'complete') {
-              element.onreadystatechange = null;
-              source.loaded = true;
-              resolve({ script: source.name, loaded: true, status: 'Loaded' });
-            }
-          };
-        } else {
-          // Others
-          element.onload = () => {
-            source.loaded = true;
-            resolve({ script: source.name, loaded: true, status: 'Loaded' });
-          };
-        }
-        element.onerror = () => resolve({ script: source.name, loaded: false, status: 'Loaded' });
-        document.getElementsByTagName('head')[0].appendChild(element);
+    if (source.loaded || this.isSourceInDOM(source)) {
+      source.loaded = true;
+      return Promise.resolve({
+        script: source.name,
+        loaded: true,
+        status: 'Already loaded',
+      });
+    }
+
+    return new Promise<ISourceLoadResult>((resolve, reject) => {
+      let element: HTMLLinkElement | HTMLScriptElement;
+
+      if (source.type === SourceType.STYLE) {
+        element = this.document.createElement('link');
+        element.rel = 'stylesheet';
+        element.href = source.src;
+      } else {
+        element = this.document.createElement('script');
+        element.type = 'text/javascript';
+        element.src = source.src;
       }
+
+      element.onload = () => {
+        source.loaded = true;
+        resolve({
+          script: source.name,
+          loaded: true,
+          status: 'Loaded',
+        });
+      };
+
+      element.onerror = () => {
+        reject({
+          script: source.name,
+          loaded: false,
+          status: 'Load failed',
+        });
+      };
+
+      this.document.head.appendChild(element);
     });
   }
+
+  private isSourceInDOM = (source: ISource): boolean =>
+    !!this.document.querySelector(source.type === SourceType.STYLE ? `link[href="${source.src}"]` : `script[src="${source.src}"]`);
 }
